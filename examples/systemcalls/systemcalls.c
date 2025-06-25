@@ -1,4 +1,12 @@
 #include "systemcalls.h"
+#include <stdlib.h>
+#include <sys/types.h>
+#include <syslog.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
 
 /**
  * @param cmd the command to execute with system()
@@ -16,6 +24,11 @@ bool do_system(const char *cmd)
  *   and return a boolean true if the system() call completed with success
  *   or false() if it returned a failure
 */
+    if(system(cmd) != 0)
+    {
+        perror("system");
+        return false;
+    }
 
     return true;
 }
@@ -58,10 +71,37 @@ bool do_exec(int count, ...)
  *   as second argument to the execv() command.
  *
 */
+    int status;
+    fflush(stdout);
+    pid_t pid = fork();
+    if(pid < 0){
+        perror("fork fail");
+        goto error;
+    } else if (pid == 0) {
+        /* child */
+        execv(command[0], command);
+        fprintf(stderr, "*** ERROR: execv failed with return value %d\n", errno);
+        fprintf(stderr, "execv: %s error: %s\n", command[0], strerror(errno));
+        exit(EXIT_FAILURE);
+    } else {
+        /* parent */
+        waitpid(pid, &status, 0);
+
+        if (WIFEXITED(status)){
+            /* child exit normally */
+            if (WEXITSTATUS(status) == EXIT_FAILURE){
+                /* child exit on failure */
+                goto error;
+            }
+        }
+    }
 
     va_end(args);
-
     return true;
+
+error:
+    va_end(args);
+    return false;
 }
 
 /**
@@ -87,13 +127,53 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
 
 /*
  * TODO
- *   Call execv, but first using https://stackoverflow.com/a/13784315/1446624 as a refernce,
+ *   Call execv, but first using https://stackoverflow.com/a/13784315/1446624 as a reference,
  *   redirect standard out to a file specified by outputfile.
  *   The rest of the behaviour is same as do_exec()
  *
 */
+    int status;
+    fflush(stdout);
+    pid_t pid = fork();
+    int fd = open(outputfile, O_WRONLY|O_TRUNC|O_CREAT, 0644);
+    if(fd < 0)
+    {
+        perror("error opening file");
+        goto error;
+    }
+    if(pid < 0){
+        perror("fork");
+        goto error;
+    } else if (pid == 0) {
+        /* child */
+        /* check*/
+        if (dup2(fd, 1) < 0) {
+            perror("dup2");
+            exit(EXIT_FAILURE);
+        }
+        close(fd);
+        execv(command[0], command);
+        fprintf(stderr, "*** ERROR: execv failed with return value %d\n", errno);
+        fprintf(stderr, "execv: %s error: %s\n", command[0], strerror(errno));
+        exit(EXIT_FAILURE);
+    } else {
+        /* parent */
+        close(fd);
+        waitpid(pid, &status, 0);
+
+        if (WIFEXITED(status)){
+            /* child exit normally */
+            if (WEXITSTATUS(status) == EXIT_FAILURE){
+                /* child exit on failure */
+                goto error;
+            }
+        }
+    }
 
     va_end(args);
-
     return true;
+
+error:
+    va_end(args);
+    return false;
 }
