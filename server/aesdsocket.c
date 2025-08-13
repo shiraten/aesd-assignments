@@ -13,11 +13,13 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <sys/queue.h>
+#include <time.h>
 
 #define PORT "9000"
 #define BACKLOG 5
 #define FILEPATH "/var/tmp/aesdsocketdata"
 #define BUF_SIZE 1024
+#define TIME_BUF_SIZE 50
 
 typedef struct thread_data {
     pthread_t thread_id;
@@ -30,12 +32,17 @@ typedef struct thread_data {
 SLIST_HEAD(thread_list, thread_data) thread_head;
 
 volatile sig_atomic_t stop = 0;
+volatile sig_atomic_t write_timestamp = 0;
 
 
-void signal_handler(int signal) {
+void handle_interrupt(int signal) {
     stop = 1;
     fprintf(stdout, "Signal received, exiting\n");
     syslog(LOG_INFO, "Signal received, exiting\n");
+}
+
+void handle_alarm(int s) {
+     write_timestamp = 1;
 }
 
 void daemonize()
@@ -60,6 +67,57 @@ void daemonize()
     }
 }
 
+void* timestamp_handler() {
+    int file_fd, rc;
+    pthread_mutex_t mutex;
+    char buffer[TIME_BUF_SIZE];
+    time_t t;
+    struct tm *tmp;
+    size_t time_len;
+
+    alarm(10);
+    while(1) {
+        if(write_timestamp) {
+            write_timestamp = 0;
+            alarm(10); // reschedule
+            /* get timestamp to buffer */
+            memset(buffer, '\0', sizeof(buffer));
+            time(&t);
+            tmp = localtime(&t);
+            time_len = strftime(buffer, sizeof(buffer), "%F-%H:%M:%S", tmp);  /* %F is equivalent to %Y-%m-%d */ 
+            /* open file */
+            file_fd = open(FILEPATH, O_CREAT | O_APPEND | O_RDWR, 0644);
+            if(file_fd == -1) {
+                fprintf(stderr, "cannot open file %s: %s\n", FILEPATH, strerror(errno));
+                syslog(LOG_ERR, "cannot open file %s: %s\n", FILEPATH, strerror(errno));
+                close(file_fd);
+                pthread_exit(NULL);
+            }
+            /* lock mutex */
+            rc = pthread_mutex_lock(&mutex);
+            if(rc != 0) {
+                syslog(LOG_ERR, "pthread_mutex_lock failed wiht %d\n", rc);
+                fprintf(stderr, "pthread_mutex_lock failed wiht %d\n", rc);
+                pthread_exit(NULL);
+            }
+            /* write to file */
+            if (write(file_fd, buffer, time_len) == -1) {
+                syslog(LOG_ERR, "Failed to write to file: %s", strerror(errno));
+                close(file_fd);
+                pthread_exit(NULL);
+            }
+            /* unlock mutex */
+            rc = pthread_mutex_unlock(&mutex);
+            if(rc != 0) {
+                syslog(LOG_ERR, "pthread_mutex_unlock failed wiht %d\n", rc);
+                fprintf(stderr, "pthread_mutex_unlock failed wiht %d\n", rc);
+                close(file_fd);
+                pthread_exit(NULL);
+            }
+        }
+    }
+}
+
 
 void* client_handler(void *thread_param) {
     char client_ip[INET6_ADDRSTRLEN];
@@ -73,9 +131,9 @@ void* client_handler(void *thread_param) {
     struct sockaddr *client_addr = thread_func_args->client_addr;
 
     /* init buffer */
-    memset(buffer, '\0', sizeof(buffer)); 
+    memset(buffer, '\0', sizeof(buffer));
     memset(buffer_file, '\0', sizeof(buffer_file));
-    memset(client_ip, 0, sizeof(client_ip));    
+    memset(client_ip, 0, sizeof(client_ip));
     if (client_addr->sa_family == AF_INET) {
         inet_ntop(AF_INET, &((struct sockaddr_in *)client_addr)->sin_addr, client_ip, INET_ADDRSTRLEN);
     } else if (client_addr->sa_family == AF_INET6) {
@@ -161,7 +219,7 @@ void cleanup_threads() {
 int main(int argc, char *argv[]) {
     struct thread_data* thread_param;
 
-    struct sigaction sa;
+    struct sigaction sa, st;
 
     int rc;
     int server_fd, client_fd;
@@ -181,11 +239,23 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    sa.sa_handler = signal_handler;
+    /* interupt signal */
+    sa.sa_handler = handle_interrupt;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
 
     if (sigaction(SIGINT, &sa, NULL) == -1 || sigaction(SIGTERM, &sa, NULL) == -1) {
+        syslog(LOG_ERR, "Failed to set up signal handlers: %s\n", strerror(errno));
+        free(thread_param);
+        return -1;
+    }
+
+    /* alarm signal */
+    st.sa_handler = handle_alarm;
+    sigemptyset(&st.sa_mask);
+    st.sa_flags = 0;
+
+    if (sigaction(SIGALRM, &st, NULL) == -1) {
         syslog(LOG_ERR, "Failed to set up signal handlers: %s\n", strerror(errno));
         free(thread_param);
         return -1;
@@ -239,6 +309,13 @@ int main(int argc, char *argv[]) {
 
     if(daemon){
         daemonize();
+    }
+
+    /* timestamp thread */
+    rc = pthread_create(&thread_param->thread_id, NULL, timestamp_handler, NULL);
+    if(rc != 0) {
+        syslog(LOG_ERR, "pthread_create failed wiht %d\n", rc);
+        return -1;
     }
 
     while (!stop) {
